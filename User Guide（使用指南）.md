@@ -1,4 +1,4 @@
-# RTF Tools v0.3 User Guide
+# RTF Tools v0.4 User Guide
 
 > Prerequisites: Windows with Microsoft Word installed. **Close all open Word documents** before running any function.
 
@@ -78,7 +78,7 @@ Merges multiple DOCX / RTF files into a single DOCX via Word COM. Supports optio
 ---
 
 
-# RTF Tools v0.3 使用说明
+# RTF Tools v0.4 使用说明
 
 > 前置条件：Windows 系统，已安装 Microsoft Word。运行任何功能前请先**关闭所有已打开的 Word 文档**。
 
