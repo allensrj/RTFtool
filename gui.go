@@ -34,6 +34,7 @@ func loadGuideLogoImage() (walk.Image, error) {
 // 保持 JSON tag 不变，兼容你已有的 config.json 文件
 type Config struct {
 	AddTocCombine           bool   `json:"add_toc_combine"`
+	AddTocCombineDocx       bool   `json:"add_toc_combine_docx"`
 	RowsCombine             string `json:"rows_combine"`
 	ChangePageCombine       bool   `json:"change_page_combine"`
 	OutPathCombine          string `json:"out_path_combine"`
@@ -92,8 +93,9 @@ type Tab1Data struct {
 // Tab3Data 继承 SharedTabElements，并添加专属组件
 type Tab3Data struct {
 	SharedTabElements
-	outPathEditCombineDocx *walk.LineEdit
-	outFileEditCombineDocx *walk.LineEdit
+	addTocCheckBoxCombineDocx *walk.CheckBox
+	outPathEditCombineDocx    *walk.LineEdit
+	outFileEditCombineDocx    *walk.LineEdit
 }
 
 type MyMainWindow struct {
@@ -707,11 +709,10 @@ func runSimpleGUI() {
 
 	if err := (MainWindow{
 		AssignTo: &mw.MainWindow,
-		Title:    "RTF Tools v0.3",
-		// 美化：大幅增加初始视窗尺寸，防止拥挤
-		MinSize: Size{Width: 850, Height: 650},
-		Size:    Size{Width: 850, Height: 650},
-		Layout:  VBox{MarginsZero: true},
+		Title:    "RTF Tools v0.4",
+		MinSize:  Size{Width: 850, Height: 650},
+		Size:     Size{Width: 850, Height: 650},
+		Layout:   VBox{MarginsZero: true},
 		Children: []Widget{
 			TabWidget{
 				Pages: []TabPage{
@@ -1065,6 +1066,8 @@ func runSimpleGUI() {
 										Title:  "3. Output Settings",
 										Layout: Grid{Columns: 2, Margins: Margins{Top: 5, Bottom: 5, Left: 10, Right: 10}, Spacing: 5},
 										Children: []Widget{
+											Label{Text: "Options:"},
+											CheckBox{Text: "Add TOC", AssignTo: &mw.tab3.addTocCheckBoxCombineDocx, Checked: mw.config.AddTocCombineDocx},
 											Label{Text: "Output Folder:"},
 											Composite{
 												Layout: HBox{MarginsZero: true, Spacing: 5},
@@ -1232,10 +1235,10 @@ func runSimpleGUI() {
 							ScrollView{
 								Layout: VBox{Spacing: 10},
 								Children: []Widget{
-									Label{Text: "Guide of RTF Page Check", Font: Font{PointSize: 16, Bold: true}, TextColor: walk.RGB(50, 100, 150)}, // 换了个沉稳的主题色
+									Label{Text: "Guide of RTF Tools", Font: Font{PointSize: 16, Bold: true}, TextColor: walk.RGB(50, 100, 150)}, // 换了个沉稳的主题色
 
 									Label{Text: "Basic Function", Font: Font{PointSize: 12, Bold: true}},
-									Label{Text: "Validates page-count consistency across all RTF files in a folder (including subfolders)."},
+									Label{Text: "This tool checks for duplicate page numbers in RTF documents within a folder and all subs-folders."},
 
 									Label{Text: "Steps", Font: Font{PointSize: 12, Bold: true}},
 									Label{Text: "1. Close any open WORD applications before checking to avoid conflicts with the program!"},
@@ -1252,34 +1255,15 @@ func runSimpleGUI() {
 									Label{Text: "2. Use the [Move Up/Down] buttons to reorder the selected RTF files."},
 									Label{Text: "3. Options: Add TOC (Adds a table of contents), Rows per Page, Refresh Page Numbers."},
 									Label{Text: "4. Enter the output file path and filename, then start combining."},
-									Label{Text: "RTF input standard", Font: Font{PointSize: 12, Bold: true}},
-									Label{Text: "1). Title and TOC Format. An IDX bookmark (e.g., IDX1) must be present. The title text must strictly follow this exact format: \\s999 \\b [Your Title Text] \\b0. Missing the style name or bold tags will result in extraction failure. "},
-									Label{Text: "2). Pagination Format. The RTF syntax for pagination must support [of] or [/] as page connectors (e.g., Page 1 of 5 or Page 1 / 5). The first page of every file must explicitly contain Page 1 and its total page count."},
-									Label{Text: "3). Document Boundary Control Tags. The RTF document must contain at least one of the following tags: \\widowctrl, \\sectd, or \\info. The program relies on these tags to properly split the Header from the Body."},
-									Label{Text: "4). Page Dimensions. The header of the first inputted RTF file must include the \\pgwsxn (width) and \\pghsxn (height) tags. These are used to determine and set the dimensions for the dynamically generated TOC page."},
 									Label{Text: "------------------------------------------------------------", TextColor: walk.RGB(180, 180, 180)},
 
 									Label{Text: "Guide of RTF/Docx Combine(General)", Font: Font{PointSize: 14, Bold: true}, TextColor: walk.RGB(50, 100, 150)},
-									Label{Text: "This tool merges multiple RTF/Docx documents into a single document for general style. General does not support adding a table of contents (TOC)."},
-									Label{Text: "1. Close any open WORD applications before checking to avoid conflicts with the program!"},
-									Label{Text: "2. Add and reorder files the same way as Tab 2 (accepts `.docx` and `.rtf`)."},
-									Label{Text: "3. Set output path and filename, then click Combine Docx Now!."},
+									Label{Text: "This tool merges multiple RTF/Docx documents into a single document for general style. TOC generation is optional."},
 									Label{Text: "------------------------------------------------------------", TextColor: walk.RGB(180, 180, 180)},
 
 									Label{Text: "Guide of RTF Converter", Font: Font{PointSize: 14, Bold: true}, TextColor: walk.RGB(50, 100, 150)},
-									Label{Text: "RTF → PDF / DOCX"},
-									Label{Text: "1. Check the desired output format(s)."},
-									Label{Text: "2. Select the source RTF file."},
-									Label{Text: "3. Click Run Conversion."},
-									Label{Text: "PDFs are automatically optimized (bookmark expansion + Fast Web View)."},
+									Label{Text: "This tool converts RTF documents to PDF and DOCX formats, convert single Docx file or Docx files in folder to RTF."},
 									Label{Text: "Conversion time depends on file size — larger files take longer. For reference, a 20MB RTF may take approximately 10 minutes."},
-									Label{Text: "------------------------------------------------------------", TextColor: walk.RGB(180, 180, 180)},
-
-									Label{Text: "DOCX → RTF"},
-									Label{Text: "1. Close any open WORD applications before checking to avoid conflicts with the program!"},
-									Label{Text: "2. Select a single `.docx` file or a folder for batch conversion."},
-									Label{Text: "3. Click Run Conversion (Docx to RTF)."},
-									Label{Text: "Conversion time depends on file size — larger files take longer."},
 
 									VSpacer{},
 									ImageView{
@@ -1288,8 +1272,8 @@ func runSimpleGUI() {
 										MinSize: Size{Width: 600, Height: 180},
 										MaxSize: Size{Width: 800, Height: 240},
 									},
-									Label{Text: "Author: Allen Sun / allensrj@qq.com", Font: Font{PointSize: 9}, TextColor: walk.RGB(100, 100, 100)},
-									Label{Text: "Special thanks to Guoping Ye for the initial proposal, Guojia Huang for the initial testing, and other colleagues for their suggestions.", Font: Font{PointSize: 9}, TextColor: walk.RGB(100, 100, 100)},
+									Label{Text: "Author: Allen Sun / allen.sun@zailaboratory.com", Font: Font{PointSize: 9}, TextColor: walk.RGB(100, 100, 100)},
+									Label{Text: "Special thanks to Guoping for the initial proposal, Guojia for the initial testing, and other colleagues for their suggestions.", Font: Font{PointSize: 9}, TextColor: walk.RGB(100, 100, 100)},
 								},
 							},
 						},
@@ -1303,6 +1287,7 @@ func runSimpleGUI() {
 
 	mw.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
 		mw.config.AddTocCombine = mw.tab1.addTocCheckBoxCombine.Checked()
+		mw.config.AddTocCombineDocx = mw.tab3.addTocCheckBoxCombineDocx.Checked()
 		mw.config.ChangePageCombine = mw.tab1.changePageCheckBoxCombine.Checked()
 		mw.config.RowsCombine = mw.tab1.rowsEditCombine.Text()
 		mw.config.OutPathCombine = mw.tab1.outPathEditCombine.Text()
@@ -1572,8 +1557,13 @@ func (mw *MyMainWindow) startMergeDocx() {
 		mw.appendLogCombineDocx(format, args...)
 	}
 
+	generateTOC := "N"
+	if mw.tab3.addTocCheckBoxCombineDocx != nil && mw.tab3.addTocCheckBoxCombineDocx.Checked() {
+		generateTOC = "Y"
+	}
+
 	// 调用的 CombineDocx
-	err := CombineDocx(resultSlices, outPath, outFile, logCallback)
+	err := CombineDocx(resultSlices, outPath, outFile, generateTOC, logCallback)
 
 	if err != nil {
 		mw.appendLogCombineDocx("❌ Failed to combine: %v", err)

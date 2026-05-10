@@ -45,7 +45,7 @@ The header of the first inputted RTF file must include the \pgwsxn (width) and \
 
 ## 3. Docx/RTF Combine (General)
 
-Merges multiple DOCX / RTF files into a single DOCX via Word COM. Does not support TOC insertion.
+Merges multiple DOCX / RTF files into a single DOCX via Word COM. Supports optional TOC insertion.
 
 **Steps:**
 **Close all open Word documents first!**
@@ -126,7 +126,7 @@ Merges multiple DOCX / RTF files into a single DOCX via Word COM. Does not suppo
 
 ## 三、Docx/RTF Combine - General（Docx/RTF 通用合并）
 
-通过 Word COM 将多个 DOCX 或 RTF 文件按顺序合并为一个 DOCX 文件。不支持 TOC。
+通过 Word COM 将多个 DOCX 或 RTF 文件按顺序合并为一个 DOCX 文件。支持可选 TOC。
 
 **步骤：**
 1. 请确保运行之前关闭任何Word文档！

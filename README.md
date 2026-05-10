@@ -8,7 +8,7 @@ A Windows desktop utility written in Go for batch processing RTF and DOCX docume
 
 - **RTF Combine (Specify)** — Merges multiple RTF files into a single RTF. Optionally generates a hyperlinked Table of Contents extracted from each file's `IDX` bookmark and `\s999 \b` title, and rewrites all `Page X of Y` footers to reflect the merged document's actual pagination. Operates on raw RTF text without requiring Word.
 
-- **Docx/RTF Combine (General)** — Merges multiple DOCX or RTF files into a single DOCX via the Word COM interface. Does not support TOC generation.
+- **Docx/RTF Combine (General)** — Merges multiple DOCX or RTF files into a single DOCX via the Word COM interface. Supports optional TOC generation.
 
 - **RTF Converter** — Converts between formats via Word COM:
   - RTF → PDF (with automatic optimization: bookmark expansion + Fast Web View)
@@ -41,7 +41,7 @@ In short: you are free to do almost anything with this code, as long as you keep
 
 - **RTF Combine - Specify（RTF 合并，指定样式）** — 将多个 RTF 文件合并为一个。可选自动生成带超链接的目录（从每个文件的 `IDX` 书签和 `\s999 \b` 标题提取），并将所有 `Page X of Y` 页脚重写为合并后的实际页码。直接操作 RTF 文本，无需调用 Word。
 
-- **Docx/RTF Combine - General（通用合并）** — 通过 Word COM 接口将多个 DOCX 或 RTF 文件合并为一个 DOCX，不支持生成目录。
+- **Docx/RTF Combine - General（通用合并）** — 通过 Word COM 接口将多个 DOCX 或 RTF 文件合并为一个 DOCX，支持可选生成目录。
 
 - **RTF Converter（格式转换）** — 通过 Word COM 进行格式转换：
   - RTF → PDF（自动优化：展开书签 + Fast Web View）

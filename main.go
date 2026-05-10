@@ -1,9 +1,11 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	_ "embed"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"os"
@@ -111,8 +113,41 @@ type ConversionResult struct {
 	Error        string
 }
 
+type parsedWordDocument struct {
+	Prefix      string
+	BodyContent string
+	Suffix      string
+}
+
 //go:embed optimize_pdf.exe
 var pdfOptimizerExe []byte
+
+var (
+	bodyPattern            = regexp.MustCompile(`(?s)\A(.*?<w:body[^>]*>)(.*?)(</w:body>.*)</w:document>\s*\z`)
+	sectPrSelfPattern      = regexp.MustCompile(`(?s)\A<w:sectPr\b[^>]*/>`)
+	sectPrFullPattern      = regexp.MustCompile(`(?s)\A<w:sectPr\b.*?</w:sectPr>`)
+	headerFooterRefPattern = regexp.MustCompile(`(?s)<w:(?:headerReference|footerReference)\b[^>]*/>`)
+	settingsSelfPattern    = regexp.MustCompile(`(?s)<w:settings\b([^>]*)/>`)
+	updateFieldsPattern    = regexp.MustCompile(`(?s)<w:updateFields\b[^>]*/>|<w:updateFields\b.*?</w:updateFields>`)
+	relationshipTagPattern = regexp.MustCompile(`(?s)<Relationship\b[^>]*/>`)
+	overrideTagPattern     = regexp.MustCompile(`(?s)<Override\b[^>]*/>`)
+	rIDPattern             = regexp.MustCompile(`\brId(\d+)\b`)
+)
+
+const defaultTOCTitle = "Table of Contents"
+const defaultTOCFieldCode = `TOC \o "1-3" \h \z \u`
+
+const (
+	settingsPath             = "word/settings.xml"
+	documentRelsPath         = "word/_rels/document.xml.rels"
+	contentTypesPath         = "[Content_Types].xml"
+	settingsRelationshipType = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings"
+	settingsContentType      = "application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"
+	updateFieldsElement      = `<w:updateFields w:val="true"/>`
+	defaultSettingsXML       = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">` + updateFieldsElement + `</w:settings>`
+	defaultRelationshipsXML  = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>`
+	defaultSettingsOverride  = `<Override PartName="/word/settings.xml" ContentType="` + settingsContentType + `"/>`
+)
 
 // ==============================================================================
 // 2. 通用辅助函数 (Shared Utility Functions)
@@ -620,40 +655,12 @@ func getPageCountFromRtfText(filePath string) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("Read filed: %v", err)
 	}
-	raw := string(content)
-
-	// Try matching directly on raw RTF first (fastest path).
-	reRaw := regexp.MustCompile(`(?i)Page\s+\d+\{?\s*(?:of|/)\s*\}?\s*(\d+)`)
-	if m := reRaw.FindStringSubmatch(raw); len(m) >= 2 {
-		return strconv.Atoi(m[1])
+	re := regexp.MustCompile(`(?i)Page\s*1.*?(\d+)`)
+	matches := re.FindStringSubmatch(string(content))
+	if len(matches) < 2 {
+		return 0, fmt.Errorf("No recognizable page number markers(Page X of X) found.")
 	}
-
-	// Fallback: clean RTF markup then match.
-	cleaned := regexp.MustCompile(`\\'[0-9a-fA-F]{2}`).ReplaceAllString(raw, " ")
-	cleaned = regexp.MustCompile(`\\[a-zA-Z]+\d*\s?`).ReplaceAllString(cleaned, " ")
-	cleaned = regexp.MustCompile(`\\[^a-zA-Z\s]`).ReplaceAllString(cleaned, " ")
-	cleaned = strings.NewReplacer("{", " ", "}", " ").Replace(cleaned)
-	cleaned = regexp.MustCompile(`\s+`).ReplaceAllString(cleaned, " ")
-
-	reCleaned := regexp.MustCompile(`(?i)\bPage\s+\d+\s+(?:of|/)\s+(\d+)\b`)
-	if m := reCleaned.FindStringSubmatch(cleaned); len(m) >= 2 {
-		return strconv.Atoi(m[1])
-	}
-
-	// Diagnostic: check raw text for "Page" to help pinpoint the issue.
-	rawLower := strings.ToLower(raw)
-	if idx := strings.Index(rawLower, "page"); idx >= 0 {
-		start := idx
-		if start > 20 {
-			start = idx - 20
-		}
-		end := idx + 80
-		if end > len(raw) {
-			end = len(raw)
-		}
-		return 0, fmt.Errorf("'Page' found in raw text but regex didn't match. Context: %q  |  File: %s", raw[start:end], filePath)
-	}
-	return 0, fmt.Errorf("No 'Page' keyword in file at all (%d bytes). File: %s", len(raw), filePath)
+	return strconv.Atoi(matches[1])
 }
 
 func findRtfFiles(dir string) ([]RTFPageCheckFileInfo, error) {
@@ -683,7 +690,7 @@ func collectCheckResults(results chan rtfPageCheckResult, total int, start time.
 		if r.err != nil {
 			final.FailedCount++
 			final.AllMatched = false
-			log("❌ Failed: %s | Error: %v\n", r.filePath, r.err)
+			log("❌ Failed: %-25s | Error: %v\n", filepath.Base(r.filePath), r.err)
 		} else if !matched {
 			final.AllMatched = false
 			log("🚨 Error: %-25s | App: %d | Text: %d | Detail: %s\n", filepath.Base(r.filePath), r.pageCountApp, r.pageCountText, r.mismatchDetail)
@@ -712,6 +719,8 @@ func OptimizePDFWithExe(inputPath string, logCallback LogCallback) error {
 	if _, err := os.Stat(inputPath); os.IsNotExist(err) {
 		return fmt.Errorf("Input file not found: %s", inputPath)
 	}
+
+	logCallback("🗜️ Optimizing PDF...\n")
 
 	exeDir, err := os.Executable()
 	if err != nil {
@@ -744,6 +753,7 @@ func OptimizePDFWithExe(inputPath string, logCallback LogCallback) error {
 	}
 
 	_ = os.Remove(inputPath)
+	logCallback("✅ PDF optimized.\n")
 	return nil
 }
 
@@ -763,6 +773,7 @@ func validateExecutable(path string) error {
 
 func RTFConverter(originalRtf string, Trans_pdf bool, Trans_docx bool, logCallback LogCallback) error {
 	start := time.Now()
+	logCallback("🚀 Starting conversion: PDF=%t, DOCX=%t\n", Trans_pdf, Trans_docx)
 
 	_ = KillWordProcesses()
 	time.Sleep(500 * time.Millisecond)
@@ -770,18 +781,23 @@ func RTFConverter(originalRtf string, Trans_pdf bool, Trans_docx bool, logCallba
 	// 1. 拷贝临时文件
 	base := filepath.Base(originalRtf)
 	copyPath := filepath.Join(filepath.Dir(originalRtf), "Copy_"+base)
+	logCallback("📄 Preparing temporary file: %s\n", filepath.Base(copyPath))
 
 	srcData, err := os.ReadFile(originalRtf)
 	if err != nil {
+		logCallback("❌ Failed to read source file.\n")
 		return fmt.Errorf("Failed to read source file: %w", err)
 	}
 	if err := os.WriteFile(copyPath, srcData, 0644); err != nil {
+		logCallback("❌ Failed to create temporary file.\n")
 		return fmt.Errorf("Failed to create temporary file: %w", err)
 	}
 
 	// 2. 执行转换
+	logCallback("⚙️ Running Word conversion...\n")
 	pdfPath, err := modifyAndConvertDoc(copyPath, Trans_pdf, Trans_docx, logCallback)
 	if err != nil {
+		logCallback("❌ Conversion failed in Word automation.\n")
 		return err
 	}
 
@@ -819,6 +835,8 @@ func modifyAndConvertDoc(copyRtfPath string, transPdf, transDocx bool, logCallba
 	oleutil.PutProperty(oleWord, "Visible", false)
 
 	docs := oleutil.MustGetProperty(oleWord, "Documents").ToIDispatch()
+	defer docs.Release()
+	logCallback("📖 Opening temporary document in Word...\n")
 	doc, err := oleutil.CallMethod(docs, "Open", copyRtfPath)
 	if err != nil {
 		return "", err
@@ -845,6 +863,7 @@ func modifyAndConvertDoc(copyRtfPath string, transPdf, transDocx bool, logCallba
 
 	if transPdf {
 		pdfPath = filepath.Join(dir, cleanBase+"_.pdf")
+		logCallback("📝 Exporting PDF...\n")
 		_, err = oleutil.CallMethod(docDisp, "ExportAsFixedFormat",
 			pdfPath, wdExportFormatPDF, 0, wdExportOptimizeForPrint,
 			wdExportAllDocument, 0, 0, wdExportDocumentContent,
@@ -852,13 +871,23 @@ func modifyAndConvertDoc(copyRtfPath string, transPdf, transDocx bool, logCallba
 		)
 		if err == nil {
 			time.Sleep(1 * time.Second)
-			_ = OptimizePDFWithExe(pdfPath, logCallback)
+			if optErr := OptimizePDFWithExe(pdfPath, logCallback); optErr != nil {
+				logCallback("⚠️ PDF optimization skipped: %v\n", optErr)
+			}
+		} else {
+			logCallback("❌ PDF export failed.\n")
 		}
 	}
 
 	if transDocx {
 		docxPath := filepath.Join(dir, cleanBase+".docx")
-		_, _ = oleutil.CallMethod(docDisp, "SaveAs", docxPath, wdFormatDocumentDefault)
+		logCallback("📝 Exporting DOCX...\n")
+		_, docxErr := oleutil.CallMethod(docDisp, "SaveAs", docxPath, wdFormatDocumentDefault)
+		if docxErr != nil {
+			logCallback("❌ DOCX export failed: %v\n", docxErr)
+		} else {
+			logCallback("✅ DOCX saved: %s\n", docxPath)
+		}
 	}
 
 	oleutil.CallMethod(docDisp, "Close", false)
@@ -956,7 +985,347 @@ func ConvertDocxToRTF(inputPath string, logCallback LogCallback) ConversionResul
 // 7. Combine Docx Module
 // ==============================================================================
 
-func CombineDocx(srcPath []string, outPath string, outFile string, logCallback LogCallback) error {
+func AddTOCToDocx(sourcePath, outputPath string) error {
+	return addTOCByOpenXML(sourcePath, outputPath)
+}
+
+func addTOCByOpenXML(sourcePath, outputPath string) error {
+	sourcePath = strings.TrimSpace(sourcePath)
+	outputPath = strings.TrimSpace(outputPath)
+	if sourcePath == "" || outputPath == "" {
+		return fmt.Errorf("source and output path are required")
+	}
+	if strings.ToLower(filepath.Ext(sourcePath)) != ".docx" || strings.ToLower(filepath.Ext(outputPath)) != ".docx" {
+		return fmt.Errorf("source/output must be .docx")
+	}
+
+	entries, err := readDocxEntries(sourcePath)
+	if err != nil {
+		return err
+	}
+	doc, err := parseWordDocument(entries["word/document.xml"])
+	if err != nil {
+		return fmt.Errorf("parse source document: %w", err)
+	}
+
+	tocSectionBreak := buildTOCSectionBreakParagraphWithoutHeaderFooter(entries["word/document.xml"])
+	parts := []string{
+		buildTextParagraph(defaultTOCTitle),
+		buildTOCFieldParagraph(`TOC \o "1-3" \h \z \u`),
+	}
+	if tocSectionBreak != "" {
+		parts = append(parts, tocSectionBreak)
+	} else {
+		parts = append(parts, buildPageBreakParagraph())
+	}
+	parts = append(parts, doc.BodyContent)
+	entries["word/document.xml"] = []byte(doc.Prefix + strings.Join(parts, "") + doc.Suffix + "</w:document>")
+
+	if err := ensureDocxUpdateFields(entries); err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil && filepath.Dir(outputPath) != "." {
+		return fmt.Errorf("create output directory: %w", err)
+	}
+	return writeDocxEntries(outputPath, entries)
+}
+
+func ensureDocxUpdateFields(entries map[string][]byte) error {
+	if err := ensureSettingsXML(entries); err != nil {
+		return err
+	}
+	if err := ensureSettingsRelationship(entries); err != nil {
+		return err
+	}
+	if err := ensureSettingsContentType(entries); err != nil {
+		return err
+	}
+	return nil
+}
+
+func ensureSettingsXML(entries map[string][]byte) error {
+	settingsXML, ok := entries[settingsPath]
+	if !ok || len(bytes.TrimSpace(settingsXML)) == 0 {
+		entries[settingsPath] = []byte(defaultSettingsXML)
+		return nil
+	}
+
+	text := string(settingsXML)
+	if updateFieldsPattern.MatchString(text) {
+		text = updateFieldsPattern.ReplaceAllString(text, updateFieldsElement)
+		entries[settingsPath] = []byte(text)
+		return nil
+	}
+
+	if settingsSelfPattern.MatchString(text) {
+		text = settingsSelfPattern.ReplaceAllString(text, `<w:settings$1>`+updateFieldsElement+`</w:settings>`)
+		entries[settingsPath] = []byte(text)
+		return nil
+	}
+
+	updated, err := insertXMLBeforeClosingTag(text, "</w:settings>", updateFieldsElement)
+	if err != nil {
+		return fmt.Errorf("update %s: %w", settingsPath, err)
+	}
+	entries[settingsPath] = []byte(updated)
+	return nil
+}
+
+func ensureSettingsRelationship(entries map[string][]byte) error {
+	relsXML := string(entries[documentRelsPath])
+	if strings.TrimSpace(relsXML) == "" {
+		relsXML = defaultRelationshipsXML
+	}
+
+	var settingsRelID string
+	for _, tag := range relationshipTagPattern.FindAllString(relsXML, -1) {
+		if !strings.Contains(tag, `Type="`+settingsRelationshipType+`"`) {
+			continue
+		}
+		settingsRelID = xmlAttrValue(tag, "Id")
+		if settingsRelID == "" {
+			settingsRelID = nextRelationshipID(relsXML)
+		}
+		replacement := fmt.Sprintf(`<Relationship Id="%s" Type="%s" Target="settings.xml"/>`, settingsRelID, settingsRelationshipType)
+		relsXML = strings.Replace(relsXML, tag, replacement, 1)
+		entries[documentRelsPath] = []byte(relsXML)
+		return nil
+	}
+
+	settingsRelID = nextRelationshipID(relsXML)
+	relElement := fmt.Sprintf(`<Relationship Id="%s" Type="%s" Target="settings.xml"/>`, settingsRelID, settingsRelationshipType)
+
+	if strings.Contains(relsXML, "/>") && strings.Contains(relsXML, "<Relationships") && strings.Contains(relsXML, "</Relationships>") == false {
+		relsXML = strings.Replace(relsXML, "/>", ">"+relElement+"</Relationships>", 1)
+		entries[documentRelsPath] = []byte(relsXML)
+		return nil
+	}
+
+	updated, err := insertXMLBeforeClosingTag(relsXML, "</Relationships>", relElement)
+	if err != nil {
+		return fmt.Errorf("update %s: %w", documentRelsPath, err)
+	}
+	entries[documentRelsPath] = []byte(updated)
+	return nil
+}
+
+func ensureSettingsContentType(entries map[string][]byte) error {
+	contentTypesXML, ok := entries[contentTypesPath]
+	if !ok || len(bytes.TrimSpace(contentTypesXML)) == 0 {
+		return fmt.Errorf("missing %s", contentTypesPath)
+	}
+
+	text := string(contentTypesXML)
+	for _, tag := range overrideTagPattern.FindAllString(text, -1) {
+		if !strings.Contains(tag, `PartName="/word/settings.xml"`) {
+			continue
+		}
+		replacement := defaultSettingsOverride
+		text = strings.Replace(text, tag, replacement, 1)
+		entries[contentTypesPath] = []byte(text)
+		return nil
+	}
+
+	updated, err := insertXMLBeforeClosingTag(text, "</Types>", defaultSettingsOverride)
+	if err != nil {
+		return fmt.Errorf("update %s: %w", contentTypesPath, err)
+	}
+	entries[contentTypesPath] = []byte(updated)
+	return nil
+}
+
+func readDocxEntries(path string) (map[string][]byte, error) {
+	if strings.ToLower(filepath.Ext(path)) != ".docx" {
+		return nil, fmt.Errorf("input must be a .docx file: %s", path)
+	}
+
+	reader, err := zip.OpenReader(path)
+	if err != nil {
+		return nil, fmt.Errorf("open DOCX %s: %w", path, err)
+	}
+	defer reader.Close()
+
+	entries := make(map[string][]byte, len(reader.File))
+	for _, file := range reader.File {
+		rc, err := file.Open()
+		if err != nil {
+			return nil, fmt.Errorf("open zip entry %s: %w", file.Name, err)
+		}
+		data, err := io.ReadAll(rc)
+		_ = rc.Close()
+		if err != nil {
+			return nil, fmt.Errorf("read zip entry %s: %w", file.Name, err)
+		}
+		entries[file.Name] = data
+	}
+
+	if len(entries["word/document.xml"]) == 0 {
+		return nil, fmt.Errorf("missing word/document.xml in %s", path)
+	}
+	return entries, nil
+}
+
+func writeDocxEntries(outputPath string, entries map[string][]byte) error {
+	file, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("create output DOCX: %w", err)
+	}
+	defer file.Close()
+
+	writer := zip.NewWriter(file)
+	names := make([]string, 0, len(entries))
+	for name := range entries {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		entryWriter, err := writer.Create(name)
+		if err != nil {
+			_ = writer.Close()
+			return fmt.Errorf("create zip entry %s: %w", name, err)
+		}
+		if _, err := entryWriter.Write(entries[name]); err != nil {
+			_ = writer.Close()
+			return fmt.Errorf("write zip entry %s: %w", name, err)
+		}
+	}
+
+	if err := writer.Close(); err != nil {
+		return fmt.Errorf("close DOCX writer: %w", err)
+	}
+	return nil
+}
+
+func parseWordDocument(docXML []byte) (parsedWordDocument, error) {
+	match := bodyPattern.FindSubmatch(docXML)
+	if len(match) != 4 {
+		return parsedWordDocument{}, fmt.Errorf("document.xml does not contain a parseable w:body")
+	}
+
+	return parsedWordDocument{
+		Prefix:      string(match[1]),
+		BodyContent: string(match[2]),
+		Suffix:      string(match[3]),
+	}, nil
+}
+
+func buildTextParagraph(text string) string {
+	return `<w:p><w:r><w:t xml:space="preserve">` + xmlEscape(text) + `</w:t></w:r></w:p>`
+}
+
+func buildTOCFieldParagraph(fieldCode string) string {
+	return `<w:p>` +
+		`<w:r><w:fldChar w:fldCharType="begin"/></w:r>` +
+		`<w:r><w:instrText xml:space="preserve"> ` + xmlEscape(fieldCode) + ` </w:instrText></w:r>` +
+		`<w:r><w:fldChar w:fldCharType="separate"/></w:r>` +
+		`<w:r><w:t>Update the TOC in Word to calculate page numbers.</w:t></w:r>` +
+		`<w:r><w:fldChar w:fldCharType="end"/></w:r>` +
+		`</w:p>`
+}
+
+func buildPageBreakParagraph() string {
+	return `<w:p><w:r><w:br w:type="page"/></w:r></w:p>`
+}
+
+func buildTOCSectionBreakParagraphWithoutHeaderFooter(templateDocumentXML []byte) string {
+	sectPr := extractBodyLevelSectPr(templateDocumentXML)
+	if strings.TrimSpace(sectPr) == "" {
+		return ""
+	}
+
+	// TOC 首页作为独立 section：去掉页眉页脚引用，避免目录页显示页眉页脚。
+	sectPr = headerFooterRefPattern.ReplaceAllString(sectPr, "")
+	return `<w:p><w:pPr>` + sectPr + `</w:pPr></w:p>`
+}
+
+func extractBodyLevelSectPr(documentXML []byte) string {
+	doc := string(documentXML)
+	bodyStart := strings.Index(doc, "<w:body")
+	if bodyStart < 0 {
+		return ""
+	}
+	bodyOpenEnd := strings.Index(doc[bodyStart:], ">")
+	if bodyOpenEnd < 0 {
+		return ""
+	}
+	bodyOpenEnd += bodyStart
+
+	bodyClose := strings.Index(doc[bodyOpenEnd+1:], "</w:body>")
+	if bodyClose < 0 {
+		return ""
+	}
+	bodyClose += bodyOpenEnd + 1
+
+	bodyContent := doc[bodyOpenEnd+1 : bodyClose]
+	sectStart := strings.LastIndex(bodyContent, "<w:sectPr")
+	if sectStart < 0 {
+		return ""
+	}
+
+	candidate := bodyContent[sectStart:]
+	match := sectPrSelfPattern.FindString(candidate)
+	if match == "" {
+		match = sectPrFullPattern.FindString(candidate)
+	}
+	if match == "" {
+		return ""
+	}
+
+	remaining := strings.TrimSpace(candidate[len(match):])
+	if remaining != "" {
+		return ""
+	}
+	return match
+}
+
+func xmlEscape(value string) string {
+	replacer := strings.NewReplacer(
+		"&", "&amp;",
+		"<", "&lt;",
+		">", "&gt;",
+		`"`, "&quot;",
+		"'", "&apos;",
+	)
+	return replacer.Replace(value)
+}
+
+func insertXMLBeforeClosingTag(xmlText, closingTag, insertion string) (string, error) {
+	idx := strings.Index(xmlText, closingTag)
+	if idx < 0 {
+		return "", fmt.Errorf("closing tag %s not found", closingTag)
+	}
+	return xmlText[:idx] + insertion + xmlText[idx:], nil
+}
+
+func xmlAttrValue(tag, attr string) string {
+	pattern := regexp.MustCompile(fmt.Sprintf(`\b%s="([^"]*)"`, regexp.QuoteMeta(attr)))
+	match := pattern.FindStringSubmatch(tag)
+	if len(match) != 2 {
+		return ""
+	}
+	return match[1]
+}
+
+func nextRelationshipID(relsXML string) string {
+	maxID := 0
+	for _, match := range rIDPattern.FindAllStringSubmatch(relsXML, -1) {
+		if len(match) != 2 {
+			continue
+		}
+		id, err := strconv.Atoi(match[1])
+		if err != nil {
+			continue
+		}
+		if id > maxID {
+			maxID = id
+		}
+	}
+	return fmt.Sprintf("rId%d", maxID+1)
+}
+
+func CombineDocx(srcPath []string, outPath string, outFile string, generateTOC string, logCallback LogCallback) error {
 	logCallback("🔍 Terminating all Word processes...\n")
 	_ = KillWordProcesses()
 
@@ -992,11 +1361,11 @@ func CombineDocx(srcPath []string, outPath string, outFile string, logCallback L
 	oleutil.PutProperty(word, "DisplayAlerts", 0)
 
 	documents := oleutil.MustGetProperty(word, "Documents").ToIDispatch()
+	defer documents.Release()
 
 	absFirstPath, _ := filepath.Abs(files[0])
 	logCallback("📖 Opening base document: %s\n", filepath.Base(absFirstPath))
 	mainDoc := oleutil.MustCallMethod(documents, "Open", absFirstPath).ToIDispatch()
-	defer mainDoc.Release()
 
 	logCallback("🔄 Merging %d documents...\n", len(files)-1)
 	for i := 1; i < len(files); i++ {
@@ -1017,6 +1386,7 @@ func CombineDocx(srcPath []string, outPath string, outFile string, logCallback L
 	logCallback("💾 Saving as temporary RTF...\n")
 	oleutil.MustCallMethod(mainDoc, "SaveAs2", tempRtfPath, wdFormatRTF)
 	oleutil.MustCallMethod(mainDoc, "Close")
+	mainDoc.Release()
 
 	logCallback("⚙️  Processing \\pgnrestart in RTF...\n")
 	// 处理 \pgnrestart
@@ -1038,6 +1408,69 @@ func CombineDocx(srcPath []string, outPath string, outFile string, logCallback L
 	oleutil.MustCallMethod(finalDoc, "SaveAs2", finalDocxPath, wdFormatDocumentDefault)
 	oleutil.MustCallMethod(finalDoc, "Close")
 	finalDoc.Release()
+
+	needTOC := strings.EqualFold(strings.TrimSpace(generateTOC), "Y")
+	if needTOC {
+		logCallback("📚 Injecting TOC into final Docx (OpenXML)...\n")
+		if err := AddTOCToDocx(finalDocxPath, finalDocxPath); err != nil {
+			logCallback("❌ Failed to inject TOC: %v\n", err)
+			oleutil.MustCallMethod(word, "Quit")
+			return err
+		}
+
+		logCallback("🌟 Reopening Document via COM to force Update TOC...\n")
+		updatedDocVar, err := oleutil.CallMethod(documents, "Open", finalDocxPath)
+		if err != nil {
+			logCallback("❌ Failed to reopen DOCX after TOC injection: %v\n", err)
+			return fmt.Errorf("failed to reopen DOCX after TOC injection: %w", err)
+		}
+		updatedDoc := updatedDocVar.ToIDispatch()
+		defer updatedDoc.Release()
+
+		tocsVar, err := oleutil.GetProperty(updatedDoc, "TablesOfContents")
+		if err != nil {
+			logCallback("⚠️ Warning: Unable to access TablesOfContents: %v\n", err)
+		} else {
+			tocs := tocsVar.ToIDispatch()
+			countVar, err := oleutil.GetProperty(tocs, "Count")
+			if err != nil {
+				logCallback("⚠️ Warning: Unable to read TOC count: %v\n", err)
+			} else {
+				tocCount := int(countVar.Val)
+				if tocCount > 0 {
+					logCallback("✨ Found %d TOC(s). Updating fields and page numbers...\n", tocCount)
+					for i := 1; i <= tocCount; i++ {
+						tocItemVar, itemErr := oleutil.CallMethod(tocs, "Item", i)
+						if itemErr != nil {
+							logCallback("⚠️ Warning: Failed to get TOC item %d: %v\n", i, itemErr)
+							continue
+						}
+						tocItem := tocItemVar.ToIDispatch()
+						if _, updateErr := oleutil.CallMethod(tocItem, "Update"); updateErr != nil {
+							logCallback("⚠️ Warning: Failed to update TOC item %d: %v\n", i, updateErr)
+						}
+						tocItem.Release()
+					}
+				} else {
+					logCallback("⚠️ Warning: No TOC found by Word COM.\n")
+				}
+			}
+			tocs.Release()
+		}
+
+		if _, err := oleutil.CallMethod(updatedDoc, "Save"); err != nil {
+			logCallback("⚠️ Warning: Failed to save DOCX after TOC update: %v\n", err)
+		}
+		if _, err := oleutil.CallMethod(updatedDoc, "Close"); err != nil {
+			logCallback("⚠️ Warning: Failed to close DOCX after TOC update: %v\n", err)
+		}
+	} else {
+		logCallback("ℹ️ TOC generation skipped (generateTOC != Y).\n")
+	}
+
+	logCallback("🚪 Quitting Word Application...\n")
+	oleutil.MustCallMethod(word, "Quit")
+	_ = os.Remove(tempRtfPath)
 
 	logCallback("🎉 Task completed successfully.\n")
 	return nil
